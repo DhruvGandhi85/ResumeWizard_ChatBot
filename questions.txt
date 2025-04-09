@@ -1,0 +1,15 @@
+What is the difference between a list where memory is contiguously allocated and a list where linked structures are used?
+When are linked lists faster than contiguously-allocated lists? 
+Add 23 to the AVL Tree below.  What imbalance case is created with inserting 23? 30 (25 (20, -), 35)
+Why is a B+ Tree a better than an AVL tree when indexing a large dataset?
+What is disk-based indexing and why is it important for database systems?  
+In the context of a relational database system, what is a transaction?  
+Succinctly describe the four components of ACID compliant transactions. 
+Why does the CAP principle not make sense when applied to a single-node MongoDB instance? 
+Describe the differences between horizontal and vertical scaling. 
+Briefly describe how a key/value store can be used as a feature store. 
+When was Redis originally released? 
+In Redis, what is the difference between the INC and INCR commands? 
+What are the benefits of BSON over JSON in MongoDB?
+Write a Mongo query based on the movies data set that returns the titles of all movies released between 2010 and 2015 from the suspense genre? 
+What does the $nin operator mean in a Mongo query?
