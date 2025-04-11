@@ -1,146 +1,61 @@
-import os
-import sys
-
-import fitz
-import numpy as np
 import ollama
 import redis
+import numpy as np
 from redis.commands.search.query import Query
+import os
+from PyPDF2 import PdfReader
+import sys
 
-# Redis connection details
-REDIS_HOST = "localhost"
-REDIS_PORT = 6380
-REDIS_DB = 0
+redis_client = redis.Redis(host="localhost", port=6380, db=0)
 
-# Vector search configuration
-VECTOR_DIM = 768
-INDEX_NAME = "embedding_index"
-DOC_PREFIX = "doc:"
-DISTANCE_METRIC = "COSINE"
+def wipe_redis():
+    redis_client.flushdb()
 
-# Chunking parameters
-DEFAULT_CHUNK_SIZE = 400
-DEFAULT_OVERLAP = 100
-
-# Default Ollama model
-DEFAULT_OLLAMA_MODEL = "deepseek-r1"
-
-# Initialize Redis client
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
-
-
-def clear_redis_store():
-    """Clears all data from the current Redis database."""
-    print("Clearing existing Redis store...")
+def redis_hnsw_index():
+    drop_index = f"FT.DROPINDEX embedding_index DD"
     try:
-        redis_client.flushdb()
-        print("Redis store cleared.")
-    except redis.exceptions.ConnectionError as e:
-        print(f"Error connecting to Redis: {e}")
-
-
-def create_hnsw_index():
-    """Creates an HNSW vector index in Redis if it doesn't exist."""
-    try:
-        redis_client.ft(INDEX_NAME).info()
-        print(f"Index '{INDEX_NAME}' already exists.")
+        redis_client.execute_command(drop_index)
     except redis.exceptions.ResponseError:
-        print(f"Creating index '{INDEX_NAME}'...")
-        schema = (
-            ("file", "TEXT"),
-            ("page", "NUMERIC"),
-            ("chunk", "TEXT"),
-            (
-                "embedding",
-                "VECTOR",
-                "HNSW",
-                6,
-                "DIM",
-                VECTOR_DIM,
-                "TYPE",
-                "FLOAT32",
-                "DISTANCE_METRIC",
-                DISTANCE_METRIC,
-            ),
-        )
-        try:
-            redis_client.ft(INDEX_NAME).create_index(fields=schema, prefix=[DOC_PREFIX])
-            print("Index created successfully.")
-        except redis.exceptions.ConnectionError as e:
-            print(f"Error connecting to Redis: {e}")
-        except redis.exceptions.ResponseError as e:
-            print(f"Error creating index: {e}")
+        pass
+    # creates index "embedding_index" on hash with prefix "doc:"
+    # and schema with fields "text" (TEXT) and "embedding" (VECTOR)
+    # with HNSW algorithm, 6 M connections, 768 dimensions, float32 type, and cosine distance metric
+    create_index = f"FT.CREATE embedding_index ON HASH PREFIX 1 doc: SCHEMA text TEXT embedding VECTOR HNSW 6 DIM 768 TYPE FLOAT32 DISTANCE_METRIC COSINE"
+    redis_client.execute_command(create_index)
+    print("Created Redis HNSW index")
 
+def get_embedding(model: str, query: str):
+    resp = ollama.embeddings(model=model, prompt=query)
+    return resp["embedding"]
 
-def get_embedding(text: str, model: str = DEFAULT_OLLAMA_MODEL) -> list[float] | None:
-    """Generates an embedding for the given text using the specified Ollama model."""
+def find_pdfs_in_subfolders(root_dir):
+    pdf_files = []
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        for file in filenames:
+            if file.lower().endswith(".pdf"):
+                pdf_files.append(os.path.join(dirpath, file))
+    return pdf_files
+
+def convert_pdf_to_text(filepath):
+    paginated_text = []
     try:
-        response = ollama.embeddings(model=model, prompt=text)
-        return response["embedding"]
-    except ollama.OllamaAPIError as e:
-        print(f"Error generating embedding with Ollama: {e}")
-        return None
+        with open(filepath, 'rb') as pdf_file:
+            pdf_reader = PdfReader(pdf_file)
+            for page_num in range(len(pdf_reader.pages)):
+                page = pdf_reader.pages[page_num]
+                text = page.extract_text()
+                paginated_text.append(text)
     except Exception as e:
-        print(f"An unexpected error occurred during embedding generation: {e}")
-        return None
+        print(f"Error reading PDF {filepath}: {e}")
+    return paginated_text
 
+def store_embedding(filename: str, page: str, chunk: str, embedding: list):
+    key = f"doc::{filename}_page_{page}_chunk_{chunk}"
+    redis_client.hset(key, mapping={"filename": filename, "page": page, "chunk": chunk,
+                                    "embedding": np.array(embedding, dtype=np.float32).tobytes(),},)
+    print(f"Stored embedding for: {chunk}")
 
-def store_embedding(file: str, page: int, chunk_index: int, chunk: str, embedding: list[float]):
-    """Stores the text chunk and its embedding in Redis."""
-    key = f"{DOC_PREFIX}:{file}_page_{page}_chunk_{chunk_index}"
-    try:
-        redis_client.hset(
-            key,
-            mapping={
-                "file": file,
-                "page": page,
-                "chunk": chunk,
-                "embedding": np.array(embedding, dtype=np.float32).tobytes(),  # Store as byte array
-            },
-        )
-        print(f"Stored embedding for: {file} - Page {page} - Chunk {chunk_index}")
-    except redis.exceptions.ConnectionError as e:
-        print(f"Error connecting to Redis: {e}")
-    except redis.exceptions.ResponseError as e:
-        print(f"Error storing embedding in Redis for key '{key}': {e}")
-
-
-def extract_text_from_pdf(pdf_path: str) -> list[tuple[int, str]]:
-    """Extracts text content from each page of a PDF file.
-
-    Args:
-        pdf_path: The path to the PDF file.
-
-    Returns:
-        A list of tuples, where each tuple contains the page number (0-based) and the extracted text from that page.
-    """
-    try:
-        doc = fitz.open(pdf_path)
-        text_by_page = []
-        for page_num, page in enumerate(doc):
-            text_by_page.append((page_num, page.get_text()))
-        return text_by_page
-    except FileNotFoundError:
-        print(f"Error: PDF file not found at '{pdf_path}'")
-        return []
-    except Exception as e:
-        print(f"Error opening or reading PDF '{pdf_path}': {e}")
-        return []
-
-
-def split_text_into_chunks(
-    text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_OVERLAP
-) -> list[str]:
-    """Splits a string of text into smaller chunks with a specified overlap.
-
-    Args:
-        text: The input string to be split.
-        chunk_size: The desired maximum number of words per chunk.
-        overlap: The number of overlapping words between consecutive chunks.
-
-    Returns:
-        A list of text chunks.
-    """
+def chunk_text_with_overlap(text, chunk_size=400, overlap=100):
     words = text.split()
     chunks = []
     for i in range(0, len(words), chunk_size - overlap):
@@ -148,61 +63,24 @@ def split_text_into_chunks(
         chunks.append(chunk)
     return chunks
 
-
-def process_pdfs(
-    model: str, data_dir: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = DEFAULT_OVERLAP
-):
-    """Processes all PDF files in the specified directory, extracting text,
-    chunking it, generating embeddings, and storing them in Redis.
-
-    Args:
-        model: The name of the Ollama model to use for embedding generation.
-        data_dir: The path to the directory containing the PDF files.
-        chunk_size: The desired size of text chunks.
-        overlap: The number of overlapping words between chunks.
-    """
-    if not os.path.isdir(data_dir):
-        print(f"Error: Directory not found at '{data_dir}'")
-        return
-
-    print(f"Processing PDF files in '{data_dir}' using model '{model}'...")
-    for file_name in os.listdir(data_dir):
-        if file_name.endswith(".pdf"):
-            pdf_path = os.path.join(data_dir, file_name)
-            text_by_page = extract_text_from_pdf(pdf_path)
-            for page_num, text in text_by_page:
-                chunks = split_text_into_chunks(text, chunk_size, overlap)
-                for chunk_index, chunk in enumerate(chunks):
-                    embedding = get_embedding(chunk, model=model)
-                    if embedding is not None:
-                        store_embedding(
-                            file=file_name,
-                            page=page_num,
-                            chunk_index=chunk_index,
-                            chunk=chunk,
-                            embedding=embedding,
-                        )
-            print(f" -----> Processed {file_name}")
-
-
-def main(ollama_model: str = DEFAULT_OLLAMA_MODEL):
-    """Main function to clear Redis, create the index, and process PDF files."""
-    clear_redis_store()
-    create_hnsw_index()
-
-    data_directory = "./data/"
-    chunk_size = DEFAULT_CHUNK_SIZE
-    overlap = DEFAULT_OVERLAP
-
-    if not os.path.exists(data_directory):
-        os.makedirs(data_directory)
-        print(f"Created data directory: {data_directory}. Please place your PDF files there.")
-    else:
-        process_pdfs(ollama_model, data_directory, chunk_size, overlap)
-
-    print("\n---Done processing PDFs---\n")
-
-
-if __name__ == "__main__":
-    model_to_use = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_OLLAMA_MODEL
-    main(model_to_use)
+def process_pdfs(model, pdf_files, chunk_size, overlap):
+    for pdf in pdf_files:
+        print(f"Processing {pdf}")
+        paginated_text = convert_pdf_to_text(pdf)
+        if not paginated_text:
+            print(f"No text found in {pdf}")
+            continue
+        for page, text in paginated_text:
+            if not text:
+                print(f"No text found on page {page} of {pdf}")
+                continue
+            chunks = chunk_text_with_overlap(text, chunk_size, overlap)
+            for chunk_index, chunk in enumerate(chunks):
+                embedding = get_embedding(model, chunk)
+                store_embedding(
+                    filename=os.path.basename(pdf),
+                    page=str(page),
+                    chunk=chunk,
+                    embedding=embedding,
+                )
+        print(f"Processed {pdf}")
