@@ -6,6 +6,7 @@ from redis.commands.search.query import Query
 import sys
 import store_in_redis
 import pandas as pd
+import re
 
 redis_client = redis.StrictRedis(host="localhost", port=6380, decode_responses=True)
 
@@ -20,7 +21,7 @@ def search_embeddings(model, query, top_k=3):
             .return_fields("id", "filename", "page", "chunk", "vector_distance")
             .dialect(2))
 
-        results = redis_client.ft("embedding_index").search(q, query_params={"vec": query_vector})
+        results = redis_client.ft("index01").search(q, query_params={"vec": query_vector})
         top_matches = [{"filename": result.filename,"page": result.page,"chunk": result.chunk,"similarity": result.vector_distance,} 
                        for result in results.docs][:top_k]
 
@@ -39,7 +40,7 @@ def generate_rag_response(chat_model, query, context_results):
 
     print(f"context_str: {context_str}")
 
-    prompt = f'As a dedicated AI assistant specializing in resume guidance, please utilize the provided contextual information to address the users query with precision. If the context lacks relevance to the query, respond with "I lack the necessary information to answer this effectively." \n Context: {context_str} \n Query: {query} \n Answer:'
+    prompt = f'As a dedicated AI assistant specializing in resume guidance, please utilize the provided contextual information to address the users query with precision. If the context lacks relevance to the query, respond with "I lack the necessary information to answer this effectively." \n Context: {context_str} \n Query: {query} \n Please elaborate on how the resume can be improved, and what should be added or removed based on similar entries. Answer:'
 
     response = ollama.chat(
         model=f"{chat_model}:latest", 
@@ -48,7 +49,8 @@ def generate_rag_response(chat_model, query, context_results):
 
     return response
 
-def create_recall_test_set(folder_path, num_samples=50):
+def create_recall_test_set(folder_path, num_samples=50, seed=1):
+    np.random.seed(seed)
     pdf_files = store_in_redis.find_pdfs_in_subfolders(folder_path)
     random_files = np.random.choice(pdf_files, size=num_samples, replace=False)
     recall_data = pd.DataFrame(columns=["query", "correct_filename"])
@@ -92,8 +94,7 @@ def compute_recall(model, ground_truth_df, top_k=5):
     print(f"Recall@{top_k} = {recall:.2%}")
     return recall
 
-
-def interactive_search(embedding_model, chat_model, query=None):
+def interactive_search(embedding_model, chat_model, query=None, breakpoint=True):
     print("RAG Search Interface")
     print("Enter blank input to quit")
 
@@ -112,9 +113,12 @@ def interactive_search(embedding_model, chat_model, query=None):
         response_content = response["message"]["content"]
         response_content = response_content.replace(",", "")
         response_content = response_content.replace("\n", "  ")
+        response_content = re.sub(r"(?<!\n)(\d+\.\s)", r"\n\1", response_content)
+
 
         print("\n Response: ")
         print(response_content)
-        break
+        if breakpoint:
+            break
 
     return response_content
